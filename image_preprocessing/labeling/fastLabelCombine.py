@@ -16,9 +16,9 @@ print(patientIDs[:5]) # preview the patients ids
 
 # iteration through each patient
 # if the patient contains the brats segmentation
-#     do labels combining, and save them as [patient_id]_tumorcore.seg.nii and [patient_id]_edema.seg.nii
+#     do labels combining, and save them as [patient_id]_combined.seg.nii
 # if the patient only contains the seg.nii segmentation
-#     save it as [patient_id]_tumorcore.seg.nii
+#     save it as [patient_id]_combined.seg.nii
 # if the patient contains neither
 #     show error and catch
 
@@ -38,8 +38,7 @@ def viewPatientFiles(num_patients=None):
         # initialize status tracking record
         record = {
             "patient_id": patientid,
-            "tumorcore_status": "Not processed",
-            "edema_status": "Not processed",
+            "combined_status": "Not processed",
             "status": "Success"
         }
 
@@ -54,54 +53,44 @@ def viewPatientFiles(num_patients=None):
         bratsSeg_file = f"{patientid}_BraTS-seg.nii.gz"
         seg_file = f"{patientid}_seg.nii.gz" 
 
-        tumorecore_out_name = f"{patientid}_tumorcore.seg.nii"
-        edema_out_name = f"{patientid}_edema.seg.nii"
+        combined_out_name = f"{patientid}_combined.seg.nii.gz"
 
         # check if it contains the brats segmentation file        
-        # if it does contain, then combine the label, save the seg files
+        # if it does contain, then combine the labels, save the combined seg file
         if bratsSeg_file in patientfiles_names:
             bratsSeg_path = os.path.join(patientDirPath, bratsSeg_file)
             bratsSeg_image = sitk.ReadImage(bratsSeg_path)               # Correct path
             bratsSeg_array = sitk.GetArrayFromImage(bratsSeg_image)      # Correct image object
 
-            # combine necrosis (1) and enhancing tumor (3/4) to Tumor Core (Total Tumor Volume)
-            tumorcore_array = np.zeros_like(bratsSeg_array, dtype=np.uint8)
-            tumorcore_array[np.isin(bratsSeg_array, [1, 3, 4])] = 1
+            # combine necrosis (1) and enhancing tumor (3/4) to Tumor Core (Total Tumor Volume = 1)
+            # and edema (2) to Edema (2)
+            combined_array = np.zeros_like(bratsSeg_array, dtype=np.uint8)
+            combined_array[np.isin(bratsSeg_array, [1, 3, 4])] = 1
+            combined_array[bratsSeg_array == 2] = 2
 
-            # save Tumor Core preserving spatial metadata
-            tumorecore_img = sitk.GetImageFromArray(tumorcore_array)
-            tumorecore_img.CopyInformation(bratsSeg_image)
-            sitk.WriteImage(tumorecore_img, os.path.join(patientDirPath, tumorecore_out_name))
-
-            # extract edema (2) as binary mask
-            edema_array = np.zeros_like(bratsSeg_array, dtype=np.uint8)
-            edema_array[bratsSeg_array == 2] = 1
-
-            # save Edema preserving spatial metadata
-            edema_img = sitk.GetImageFromArray(edema_array)
-            edema_img.CopyInformation(bratsSeg_image)                    # Correct image object
-            sitk.WriteImage(edema_img, os.path.join(patientDirPath, edema_out_name))
+            # save Combined Segmentations preserving spatial metadata
+            combined_img = sitk.GetImageFromArray(combined_array)
+            combined_img.CopyInformation(bratsSeg_image)
+            sitk.WriteImage(combined_img, os.path.join(patientDirPath, combined_out_name))
             
-            record["tumorcore_status"] = "Combined & Saved"
-            record["edema_status"] = "Extracted & Saved"
+            record["combined_status"] = "Combined & Saved"
             record["status"] = "Processed (BraTS)"
 
-        # if it does not contain BraTS-seg but contains standard seg, save the seg file directly
+        # if it does not contain BraTS-seg but contains standard seg, save as tumorcore
         elif seg_file in patientfiles_names:
             seg_img_path = os.path.join(patientDirPath, seg_file)
             seg_image = sitk.ReadImage(seg_img_path)
             
-            # Save standard seg as tumorcore directly
-            sitk.WriteImage(seg_image, os.path.join(patientDirPath, tumorecore_out_name))
+            # Save standard seg as tumorcore directly (saving as .nii.gz)
+            tumorcore_out_name = f"{patientid}_tumorcore.seg.nii.gz"
+            sitk.WriteImage(seg_image, os.path.join(patientDirPath, tumorcore_out_name))
             
-            record["tumorcore_status"] = "Saved directly"
-            record["edema_status"] = "N/A"
+            record["combined_status"] = "Saved as tumorcore"
             record["status"] = "Processed (Standard Seg)"
 
         # if it contains neither
         else:
-            record["tumorcore_status"] = "Missing"
-            record["edema_status"] = "Missing"
+            record["combined_status"] = "Missing"
             record["status"] = "Error: No segmentation files found"
             print(f"Warning: Patient {patientid} has no segmentation files.")
 
