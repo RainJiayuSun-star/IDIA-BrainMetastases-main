@@ -51,27 +51,39 @@ def parse_yaml_fallback(filepath):
     """
     A lightweight, zero-dependency parser for YAML files.
     Allows loading configurations without PyYAML installed.
+    Respects indentation so nested blocks (n4_params / in_params) do not
+    swallow subsequent top-level keys like patient_range / num_workers.
     """
     config = {}
     current_key = None
     with open(filepath, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
+        for raw_line in f:
+            # Preserve leading whitespace to detect nesting; strip trailing comments/newlines
+            if '#' in raw_line:
+                # Only strip comments outside quoted strings (simple heuristic)
+                hash_idx = raw_line.find('#')
+                # Treat full-line comments and trailing inline comments
+                if raw_line.lstrip().startswith('#'):
+                    continue
+                # Inline comment: keep content before ' #'
+                if ' #' in raw_line:
+                    raw_line = raw_line.split(' #', 1)[0]
+            if not raw_line.strip():
                 continue
+
+            indent = len(raw_line) - len(raw_line.lstrip(' '))
+            line = raw_line.strip()
+
             if ':' in line:
                 parts = line.split(':', 1)
                 k = parts[0].strip()
                 v = parts[1].strip()
-                
+
                 # Check if it starts a list or dict block
                 if not v:
                     current_key = k
                     config[k] = [] if k == 'steps' else {}
                 else:
-                    # Clean inline comments
-                    if ' #' in v:
-                        v = v.split(' #', 1)[0].strip()
                     # Parse basic types
                     if v.lower() == 'true':
                         v = True
@@ -80,8 +92,18 @@ def parse_yaml_fallback(filepath):
                     elif v.lower() == 'none':
                         v = None
                     elif v.startswith('[') and v.endswith(']'):
-                        # Parse lists like [3, 6] or [2, 3, 5, 6]
-                        v = [int(x.strip()) for x in v[1:-1].split(',') if x.strip()]
+                        # Parse lists like [3, 6], [21, 91], or ["a", "b"]
+                        items = [x.strip() for x in v[1:-1].split(',') if x.strip()]
+                        parsed = []
+                        for item in items:
+                            if (item.startswith('"') and item.endswith('"')) or (item.startswith("'") and item.endswith("'")):
+                                parsed.append(item[1:-1])
+                            else:
+                                try:
+                                    parsed.append(int(item) if '.' not in item else float(item))
+                                except ValueError:
+                                    parsed.append(item)
+                        v = parsed
                     else:
                         try:
                             if '.' in v:
@@ -92,8 +114,9 @@ def parse_yaml_fallback(filepath):
                             # Keep as clean string
                             if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                                 v = v[1:-1]
-                    
-                    if current_key and isinstance(config[current_key], dict):
+
+                    # Nested keys are indented; top-level keys reset the block
+                    if indent > 0 and current_key and isinstance(config.get(current_key), dict):
                         config[current_key][k] = v
                     else:
                         config[k] = v
