@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-IDiA Lab - Step 3 N4 Bias Field Correction Pipeline (rain_preprocess_step3_bc.py)
-=================================================================================
+IDiA Lab - Step 3 N4 Bias Field Correction Pipeline (Single-Worker Edition)
+=============================================================================
+File: rain_preprocess_step3_bc.py
+
 Combines Jared's robust logging framework (logging_jbBiasCorrection_BrambleScript_V2.py)
 with rain_preprocess.py's automatic Otsu thresholding fallback for datasets without 
 pre-computed brain masks.
@@ -14,7 +16,7 @@ Features:
   3. Smart Modality & Scan Discovery: Filters out segmentation masks (*seg.nii.gz) so N4 bias 
      correction is only applied to continuous MRI structural scans.
   4. Memory-Safe Sequential Processing: Explicit ITK object cleanup & garbage collection per patient.
-  5. Multi-Dataset Support: Pre-configured for Brain-Mets-Lung and BraTS 2025/2026 MET datasets.
+  5. Automatic Resume & Skip Tracking: Skips completed subjects in 0.0s upon re-run.
 
 Author: IDiA Lab
 Date: August 2026
