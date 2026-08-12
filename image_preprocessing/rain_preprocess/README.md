@@ -3,13 +3,15 @@
 
 Welcome to the **Unified Preprocessing Pipeline**! This folder contains a highly modular, clean, and reusable Python framework designed to run standard clinical neuroimaging operations on diverse datasets (such as **Yale/Brain-Mets-Lung** and **UCSF-BSMR**) from a single execution interface.
 
-Instead of running separate standalone scripts for co-registration, skull-stripping, N4 bias correction, warping, and normalization, you can now define your entire preprocessing sequence inside a simple **YAML configuration file** and run it in a single command.
+Instead of running separate standalone scripts for co-registration, skull-stripping, N4 bias correction, warping, and normalization, you can now define your entire preprocessing sequence inside a simple **YAML configuration file** or run targeted processing using dedicated step scripts.
 
 ---
 
 ## 📂 Folder Layout
-*   `rain_preprocess.py`: The core pipeline orchestrator containing all processing algorithm wrappers.
+*   `rain_preprocess.py`: The core pipeline orchestrator containing all processing algorithm wrappers (Steps 1, 2, 3, 5, 6).
+*   `rain_preprocess_step3_bc.py`: Dedicated Step 3 N4 Bias Correction script featuring automatic Otsu thresholding fallback (for datasets without brain masks), PDF/Excel error logging, and automatic resume/skip tracking.
 *   `config.yaml`: The user-configurable parameters file mapping directories and step lists.
+*   `config_brain_lung.yaml`: Configuration template tuned for Brain-Mets-Lung preprocessing.
 *   `README.md`: This documentation.
 
 ---
@@ -80,7 +82,7 @@ Open `config.yaml` and adjust the paths and settings:
 *   `steps`: An array of selected running step numbers (e.g. `[3, 6]`).
 *   `device`: Set to `"cuda"` if you are running Step 2 (HD-BET) on a GPU-enabled machine, or `"cpu"` otherwise.
 
-### 3. Run the Pipeline
+### 3. Run the Pipeline (`rain_preprocess.py`)
 To start the pipeline execution, you can specify your configuration file using a named argument or a positional argument. If no file is specified, it defaults to `config.yaml` in the current directory:
 ```bash
 # Option A: Run using the named config flag (recommended)
@@ -94,6 +96,43 @@ python rain_preprocess.py
 # Option C: Run using the positional argument (backwards compatible)
 python rain_preprocess.py config.yaml
 ```
+
+### 4. Run Dedicated Step 3 Bias Correction (`rain_preprocess_step3_bc.py`)
+When you specifically need **Step 3: N4 Bias Field Correction** on single-worker setups (with or without pre-computed brain masks):
+
+```bash
+# Option A: Run Pre-configured Dataset 1 (Brain-Mets-Lung)
+python rain_preprocess_step3_bc.py -d 1
+
+# Option B: Run Pre-configured Dataset 2 (BraTS2025-MET)
+python rain_preprocess_step3_bc.py -d 2
+
+# Option C: Test on a small patient subset (e.g. patients 0 to 5)
+python rain_preprocess_step3_bc.py -d 1 -s 0:5
+
+# Option D: Run on Custom Input and Output Directories
+python rain_preprocess_step3_bc.py -i /path/to/input_root -o /path/to/output_root
+```
+
+### 5. Run Multi-Worker Server Edition (`rain_preprocess_step3_bc_multiworker.py`)
+For high-speed parallel scaling on large multi-socket CPU servers (e.g. 192 CPUs / 96 physical cores):
+
+```bash
+# Option A: Run Dataset 1 (Brain-Mets-Lung) with 32 parallel worker processes
+python rain_preprocess_step3_bc_multiworker.py -d 1 -w 32
+
+# Option B: Run Dataset 2 (BraTS2025-MET) with 64 parallel worker processes
+python rain_preprocess_step3_bc_multiworker.py -d 2 -w 64
+
+# Option C: Run Custom Dataset with 96 Workers and 5 Max Reschedule Passes
+python rain_preprocess_step3_bc_multiworker.py -i /path/to/input -o /path/to/output -w 96 --max_retries 5
+```
+
+**Multi-Worker Server Edition Features**:
+* **Parallel Scaling & Thread Isolation**: Spans parallel process workers (`-w 32/64/96`) while locking SimpleITK to single-threaded mode per worker (`sitk.SetGlobalDefaultNumberOfThreads(1)`) to eliminate CPU thrashing and oversubscription across NUMA sockets.
+* **Atomic Scheduling & Duplicate Prevention**: Uses file locks (`.processing.lock`) per subject directory to guarantee zero worker collision or duplicate processing.
+* **Automated Post-Pass Verification & Rescheduling**: Scans 100% of output directories after worker pool completion. If any subjects remain incomplete, it automatically triggers retry passes until all subjects are verified complete.
+* **Centralized Process-Safe PDF & Excel Logs**: Master process collects worker results into clean PDF and Excel logs.
 
 ---
 
