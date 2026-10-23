@@ -1,0 +1,57 @@
+# General CPU N4 configuration. Requires Python 3.9+, SimpleITK, numpy and PyYAML.
+# Run: python3 rain_preprocess_step3_bc_multiworker.py --config config_step3.example.yaml --dry-run
+# Remove --dry-run only when ready to process. -i / -o / -w override local paths/workers.
+# Use your own local collection root: it must directly contain the case/scan folders.
+input_dir: 'D:/A1_RainSun_20240916/1-UWMadison/IDiA-Lab/Medical_Images_Public/UCSD-BMETS-Longitudinal-2026/PKG - UCSD-BMETS-Longitudinal/UCSD-BMETS-Longitudinal'
+output_dir: null  # Omit/null = save _BC images beside originals, without overwriting originals.
+# output_dir: '/data/UCSD_bias_corrected'  # Alternatively preserve <output_dir>/<case_id>/.
+
+# Inclusion list: null means all visible case/scan folders. IDs must match folder names.
+# TXT: one ID per line (blank lines and # comments ignored).
+# CSV: a column containing exact folder IDs, e.g. BMETS0043_03, not just BMETS0043.
+# Relative paths below are resolved against THIS YAML's directory, not the terminal's cwd.
+case_list:
+  path: null  # Example: 'included_scans.csv' or 'included_scans.txt'
+  id_column: 'case_id'  # CSV only; can be 'study_id' for an existing study-level CSV.
+
+# All configured images are required. Missing image/configured mask => log and skip whole case.
+# Exact filenames only; {case_id} is the folder name. Fixed filenames work too.
+# Change these rules for another dataset, e.g. '{case_id}_FLAIR.nii.gz' or 'FLAIR.nii'.
+images:
+  t1c:
+    filename: '{case_id}-t1c.nii.gz'
+  # t1n:
+  #   filename: '{case_id}-t1n.nii.gz'
+  flair:
+    filename: '{case_id}-t2f.nii.gz'
+    # mask_filename: '{case_id}-flair_brain_mask.nii.gz'  # Optional per-image override.
+  # t2w:
+  #   filename: '{case_id}-t2w.nii.gz'
+
+# Shared optional brain mask. Null = Otsu independently for each image.
+# Per-image mask_filename overrides this, including explicit null to use Otsu.
+# A tumor segmentation is NOT a brain mask. Configured mask must match image geometry.
+brain_mask_filename: null
+
+# Relevant for a separate output directory only; in-place operation copies nothing.
+# none: corrected images only. listed: copy the exact templates below unchanged.
+# all_unselected: copy other immediate original files, excluding generated artifacts.
+companions:
+  mode: 'listed'
+  filenames:
+    - '{case_id}-seg.nii.gz'
+
+num_workers: 4  # One image per task. Adjust concurrent images for available CPUs and RAM.
+itk_threads_per_worker: 1  # Positive integer; --itk_threads_per_worker overrides this.
+# Requested computation-thread budget = num_workers * itk_threads_per_worker.
+# Example server trial: 24 workers * 4 threads = budget 96 (not guaranteed CPU utilization).
+# Keep this default at 1 for existing behavior; benchmark 1/2/4 threads before scaling up.
+# CPU oversubscription prints a warning and continues. Check your job's actual allocation.
+# Changing thread count can slightly change floating-point results and triggers recomputation.
+max_retries: 3  # Additional passes for failed/locked scans.
+retry_delay: 2.0
+n4_params:
+  shrink_factor: 2
+  num_fitting_levels: 4
+  num_iters: 50
+  convergence_thresh: 0.000001
