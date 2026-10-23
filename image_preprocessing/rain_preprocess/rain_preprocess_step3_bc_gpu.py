@@ -2,20 +2,21 @@
 """
 IDiA Lab - Step 3 GPU-Accelerated N4 Bias Field Correction Pipeline (rain_preprocess_step3_bc_gpu.py)
 ===================================================================================================
-GPU-accelerated implementation of N4 Bias Field Correction using PyTorch CUDA tensors and 3D separable 
-multi-resolution spatial Gaussian filtering. Designed to deliver a 30x–50x speedup over CPU SimpleITK N4 
-(processing 4 structural MRI scans in ~1.5 seconds per subject instead of ~60-70s).
+Reference algorithm is Jared V2 (logging_jbBiasCorrection_BrambleScript_V2.py):
 
-Features:
-  1. PyTorch CUDA GPU Acceleration: Ultra-fast 3D tensor computations on NVIDIA GPU (RTX 4070, etc.).
-  2. CPU Fallback: Automatically falls back to SimpleITK N4 if CUDA is unavailable or if --backend sitk is specified.
-  3. PDF Logging & Excel Error Tracking (fpdf2 / pandas), matching rain_preprocess_step3_bc.py.
-  4. Automatic Brain Mask Fallback: Uses existing brain masks (_SS_bet.nii.gz, _mask.nii.gz) or automatically 
-     computes an Otsu threshold foreground mask (sitk.OtsuThreshold) on the fly.
-  5. Smart Modality & Scan Discovery: Filters out segmentation masks (*seg.nii.gz) so N4 bias correction is 
-     only applied to continuous MRI structural scans.
-  6. Memory-Safe Sequential Processing: Explicit GPU memory clearing (torch.cuda.empty_cache()) & garbage collection.
-  7. Multi-Dataset Support: Pre-configured for Brain-Mets-Lung (Dataset 1) and BraTS 2025/2026 MET (Dataset 2).
+  sitk.N4BiasFieldCorrectionImageFilter on sitk.Shrink'd volumes
+  log_B = corrector.GetLogBiasFieldAsImage(full_res_image)
+  I_corrected = image / sitk.Exp(log_B)   # background is NOT zeroed
+
+For model-benchmark inference, use --backend sitk (numerically the Jared/ANTs N4).
+--backend gpu is a CUDA N3/N4-style approximation (B-spline replaced by masked Gaussian)
+on the same shrink grid and the same apply formula. Do not mix GPU-BC and sitk-BC
+volumes in one benchmark table.
+
+Backends:
+  --backend sitk  SimpleITK N4ITK (Jared V2; required for benchmark-comparable output)
+  --backend gpu   PyTorch CUDA N3/N4-style (default; same I/O + apply formula)
+  --backend n4ax  n4ax if importable, else gpu
 
 Author: IDiA Lab
 Date: August 2026
@@ -36,12 +37,17 @@ import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
 
-# Try importing fpdf (fpdf2) for PDF log creation
 try:
     from fpdf import FPDF
     HAS_FPDF = True
 except ImportError:
     HAS_FPDF = False
+
+try:
+    import n4ax
+    HAS_N4AX = True
+except ImportError:
+    HAS_N4AX = False
 
 # ==========================================
 # 1. USER CONFIGURATION & PRESETS
@@ -52,23 +58,23 @@ DATASETS_CONFIG = {
     "1": {
         "name": "Brain-Mets-Lung",
         "input_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\Brain-Mets-Lung-MRI-Path-Segs_Coregistered",
-        "output_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\Brain-Mets-Lung-MRI-Path-Segs_Coregistered_BC",
+        "output_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\Brain-Mets-Lung-MRI-Path-Segs_Coregistered_BC_gpu",
     },
     "2": {
         "name": "BraTS2025-MET",
         "input_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\BraTS2026\MICCAI-LH-BraTS2025-MET-Challenge-Training",
-        "output_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\BraTS2026\BraTS2025-MET-Training-BC_complete",
+        "output_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\BraTS2026\BraTS2025-MET-Training-BC_gpu",
     }
 }
 
-# N4 Algorithm Default Parameters
+# N4 Algorithm Default Parameters (Jared V2)
 DEFAULT_PARAMETERS = {
-    "shrink_factor": 2,          # Downsampling factor (1 = full res, 2 = 2x speedup default, 4 = fastest)
-    "num_fitting_levels": 4,     # Multi-resolution fitting levels
-    "num_iters": 50,             # Max iterations per fitting level (for sitk fallback)
-    "convergence_thresh": 1e-6,  # Convergence threshold (for sitk fallback)
-    "backend": "gpu",            # Backend: 'gpu' (PyTorch CUDA) or 'sitk' (SimpleITK CPU)
-    "device": "cuda",            # PyTorch device
+    "shrink_factor": 2,
+    "num_fitting_levels": 4,
+    "num_iters": 50,             # Max iterations per fitting level (Jared V2)
+    "convergence_thresh": 1e-6,
+    "backend": "gpu",            # 'gpu' | 'n4ax' | 'sitk'
+    "device": "cuda",
 }
 
 # Suffix for bias-corrected output files
@@ -117,102 +123,244 @@ class PDFLogger:
 
 
 # ==========================================
-# 3. PYTORCH GPU N4 BIAS FIELD CORRECTION ENGINE
+# 3. N4 ENGINES (Jared V2 sitk + GPU-style)
 # ==========================================
-def n4_bias_field_correction_gpu(img_sitk, mask_sitk, shrink_factor=2, device_str="cuda"):
-    """
-    Fast GPU-accelerated N4 Bias Field Correction using PyTorch CUDA.
-    
-    Parameters:
-        img_sitk (sitk.Image): Input SimpleITK image.
-        mask_sitk (sitk.Image): SimpleITK brain / foreground mask image.
-        shrink_factor (int): Downsampling factor for fast coarse-grid field estimation.
-        device_str (str): PyTorch device ('cuda' or 'cpu').
-        
-    Returns:
-        sitk.Image: Bias-corrected SimpleITK image with original metadata preserved.
-    """
-    device = torch.device(device_str if torch.cuda.is_available() and device_str.startswith("cuda") else "cpu")
-    
-    # Convert SimpleITK images to numpy float32
-    img_arr = sitk.GetArrayFromImage(img_sitk).astype(np.float32)
-    mask_arr = sitk.GetArrayFromImage(mask_sitk).astype(np.float32)
-    
-    # Push to GPU tensor
-    img_t = torch.from_numpy(img_arr).to(device)
-    mask_t = torch.from_numpy(mask_arr).to(device)
-    
-    # Binarize mask
-    mask_t = (mask_t > 0).float()
-    
-    # Downsample for fast low-frequency bias field fitting
+def _is_nifti(name):
+    n = name.lower()
+    return n.endswith(".nii.gz") or n.endswith(".nii")
+
+
+def _is_brain_mask_file(name):
+    n = name.lower()
+    if not _is_nifti(name):
+        return False
+    return (
+        "brain_mask" in n
+        or n.endswith("_ss_bet.nii.gz")
+        or n.endswith("_ss_bet.nii")
+        or n.endswith("_bet.nii.gz")
+        or n.endswith("_bet.nii")
+        or "_ss_bet." in n
+    )
+
+
+def _is_seg_file(name):
+    n = name.lower()
+    if not _is_nifti(name) or _is_brain_mask_file(name):
+        return False
+    return any(k in n for k in ("seg", "label", "tumor"))
+
+
+def _bc_output_name(scan_name):
+    if scan_name.endswith(".nii.gz"):
+        return scan_name[:-7] + OUTPUT_SUFFIX
+    if scan_name.endswith(".nii"):
+        return scan_name[:-4] + OUTPUT_SUFFIX
+    return scan_name + OUTPUT_SUFFIX
+
+
+def _paired_mask_name(img_file, all_files):
+    """Jared V2: <stem>_SS.nii.gz -> <stem>_SS_bet.nii.gz; also stem_bet / brain_mask."""
+    file_set = set(all_files)
+    if img_file.endswith("_SS.nii.gz"):
+        jared = img_file.replace("_SS.nii.gz", "_SS_bet.nii.gz")
+        if jared in file_set:
+            return jared
+    if img_file.endswith("_SS.nii"):
+        jared = img_file.replace("_SS.nii", "_SS_bet.nii")
+        if jared in file_set:
+            return jared
+    stem = img_file[:-7] if img_file.endswith(".nii.gz") else (img_file[:-4] if img_file.endswith(".nii") else img_file)
+    for cand in (
+        stem + "_bet.nii.gz",
+        stem + "_bet.nii",
+        stem + "_brain_mask.nii.gz",
+        stem + "_brain_mask.nii",
+        stem + "_SS_bet.nii.gz",
+    ):
+        if cand in file_set:
+            return cand
+    return None
+
+
+def _ensure_mask_on_image(mask_sitk, img_sitk):
+    same = (
+        mask_sitk.GetSize() == img_sitk.GetSize()
+        and mask_sitk.GetSpacing() == img_sitk.GetSpacing()
+        and mask_sitk.GetOrigin() == img_sitk.GetOrigin()
+        and mask_sitk.GetDirection() == img_sitk.GetDirection()
+    )
+    if same:
+        return sitk.Cast(mask_sitk, sitk.sitkUInt8)
+    return sitk.Resample(
+        mask_sitk, img_sitk, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8
+    )
+
+
+def n4_bias_field_correction_sitk(
+    img_sitk,
+    mask_sitk,
+    shrink_factor=2,
+    num_fitting_levels=4,
+    num_iters=50,
+    convergence_thresh=1e-6,
+):
+    """Exact Jared V2 / rain_preprocess_step3_bc.py SimpleITK N4."""
+    mask_sitk = _ensure_mask_on_image(mask_sitk, img_sitk)
     if shrink_factor > 1:
-        img_sub = F.avg_pool3d(img_t[None, None, ...], shrink_factor, stride=shrink_factor)[0, 0]
-        mask_sub = F.max_pool3d(mask_t[None, None, ...], shrink_factor, stride=shrink_factor)[0, 0]
+        img_shrunk = sitk.Shrink(img_sitk, [shrink_factor] * img_sitk.GetDimension())
+        mask_shrunk = sitk.Shrink(mask_sitk, [shrink_factor] * img_sitk.GetDimension())
     else:
-        img_sub, mask_sub = img_t, mask_t
-        
+        img_shrunk, mask_shrunk = img_sitk, mask_sitk
+
+    corrector = sitk.N4BiasFieldCorrectionImageFilter()
+    corrector.SetMaximumNumberOfIterations([int(num_iters)] * int(num_fitting_levels))
+    corrector.SetConvergenceThreshold(float(convergence_thresh))
+    corrector.Execute(img_shrunk, mask_shrunk)
+    log_bias_field = corrector.GetLogBiasFieldAsImage(img_sitk)
+    corrected_img = img_sitk / sitk.Exp(log_bias_field)
+    del img_shrunk, mask_shrunk, corrector, log_bias_field
+    return corrected_img
+
+
+def _separable_gaussian(vol, mask, sigma, eps=1e-5):
+    """Masked 3D separable Gaussian (normalized by smoothed mask so edges do not darken)."""
+    if sigma < 0.5:
+        return vol
+    device = vol.device
+    ksize = int(sigma * 3) | 1
+    t = torch.arange(ksize, device=device, dtype=torch.float32) - (ksize // 2)
+    k1d = torch.exp(-t ** 2 / (2.0 * sigma ** 2))
+    k1d = (k1d / k1d.sum()).view(1, 1, -1)
+    pad = ksize // 2
+    num = vol * mask
+    den = mask
+    num = F.conv3d(num[None, None], k1d.view(1, 1, -1, 1, 1), padding=(pad, 0, 0))
+    num = F.conv3d(num, k1d.view(1, 1, 1, -1, 1), padding=(0, pad, 0))
+    num = F.conv3d(num, k1d.view(1, 1, 1, 1, -1), padding=(0, 0, pad))[0, 0]
+    den = F.conv3d(den[None, None], k1d.view(1, 1, -1, 1, 1), padding=(pad, 0, 0))
+    den = F.conv3d(den, k1d.view(1, 1, 1, -1, 1), padding=(0, pad, 0))
+    den = F.conv3d(den, k1d.view(1, 1, 1, 1, -1), padding=(0, 0, pad))[0, 0]
+    return num / torch.clamp(den, min=eps)
+
+
+def _n3_histogram_sharpen(log_resid, mask, n_bins=200, fwhm=0.15):
+    """
+    N3-style 1D histogram sharpening (Sled 1998), used inside N4.
+    Wiener-deconvolves the foreground log-intensity histogram, then maps voxels
+    onto the sharpened distribution. No autograd needed.
+    """
+    fg = mask > 0.5
+    if int(fg.sum().item()) < n_bins:
+        return log_resid
+    vals = log_resid[fg]
+    vmin = torch.quantile(vals, 0.001)
+    vmax = torch.quantile(vals, 0.999)
+    if float((vmax - vmin).item()) < 1e-6:
+        return log_resid
+    vals_c = vals.clamp(vmin, vmax)
+    hist = torch.histc(vals_c, bins=n_bins, min=float(vmin.item()), max=float(vmax.item())) + 1e-6
+    bin_width = (vmax - vmin) / n_bins
+    sigma_bins = (fwhm / 2.355) / torch.clamp(bin_width, min=1e-6)
+    freqs = torch.fft.rfftfreq(n_bins, device=log_resid.device)
+    g = torch.exp(-0.5 * (2.0 * torch.pi * freqs * sigma_bins) ** 2)
+    h_f = torch.fft.rfft(hist)
+    h_sharp = torch.fft.irfft(h_f * g / (g * g + 0.01), n=n_bins).clamp_min(1e-8)
+    cdf_src = torch.cumsum(hist, 0)
+    cdf_src = cdf_src / cdf_src[-1]
+    cdf_dst = torch.cumsum(h_sharp, 0)
+    cdf_dst = cdf_dst / cdf_dst[-1]
+    # Invert sharpened CDF: src_cdf(value) -> intensity on sharpened histogram
+    x = (vals_c - vmin) / (vmax - vmin) * (n_bins - 1)
+    x0 = x.long().clamp(0, n_bins - 2)
+    a = (x - x0.float()).clamp(0.0, 1.0)
+    cdf_v = cdf_src[x0] * (1.0 - a) + cdf_src[x0 + 1] * a
+    # Searchsorted on CDF for inverse mapping
+    idx = torch.searchsorted(cdf_dst, cdf_v).clamp(1, n_bins - 1)
+    c0 = cdf_dst[idx - 1]
+    c1 = cdf_dst[idx]
+    w = (cdf_v - c0) / torch.clamp(c1 - c0, min=1e-8)
+    sharp_vals = vmin + (idx.float() - 1.0 + w) / (n_bins - 1) * (vmax - vmin)
+    out = log_resid.clone()
+    out[fg] = sharp_vals
+    return out
+
+
+def n4_bias_field_correction_gpu(
+    img_sitk,
+    mask_sitk,
+    shrink_factor=2,
+    num_fitting_levels=4,
+    num_iters=50,
+    convergence_thresh=1e-6,
+    device_str="cuda",
+):
+    """
+    GPU N4-style correction on the Jared V2 shrink grid.
+
+    Same as Jared for: sitk.Shrink, full-res apply I/exp(log_B), background preserved.
+    Different from Jared: B-spline N4 replaced by N3 histogram sharpening + masked Gaussian.
+    """
+    device = torch.device(device_str if torch.cuda.is_available() and str(device_str).startswith("cuda") else "cpu")
+    mask_sitk = _ensure_mask_on_image(mask_sitk, img_sitk)
+
+    if shrink_factor > 1:
+        img_shrunk = sitk.Shrink(img_sitk, [shrink_factor] * img_sitk.GetDimension())
+        mask_shrunk = sitk.Shrink(mask_sitk, [shrink_factor] * img_sitk.GetDimension())
+    else:
+        img_shrunk, mask_shrunk = img_sitk, mask_sitk
+
+    img_sub = torch.from_numpy(sitk.GetArrayFromImage(img_shrunk).astype(np.float32)).to(device)
+    mask_sub = (torch.from_numpy(sitk.GetArrayFromImage(mask_shrunk).astype(np.float32)).to(device) > 0).float()
+
     eps = 1e-5
-    log_img = torch.log(torch.clamp(img_sub, min=eps)) * mask_sub
-    bias_field = torch.zeros_like(log_img)
-    
-    # Multi-resolution spatial Gaussian scale fitting (coarse to fine scales)
-    # Using 3D separable 1D Gaussian kernel convolutions for max GPU memory speed
-    sigmas = [32.0, 16.0, 8.0, 4.0]
-    iters_per_scale = 5
-    
+    log_img = torch.log(torch.clamp(img_sub, min=eps))
+    bias = torch.zeros_like(log_img)
+
+    n_levels = max(1, int(num_fitting_levels))
+    sigmas = [max(2.0, 16.0 / (2 ** i)) for i in range(n_levels)]
+
+    fg = mask_sub > 0.5
     for sig in sigmas:
-        kernel_size = int(sig * 3) | 1
-        k1d = torch.exp(-torch.arange(-kernel_size//2 + 1, kernel_size//2 + 1, device=device).float()**2 / (2 * sig**2))
-        k1d = (k1d / k1d.sum()).view(1, 1, -1)
-        pad = kernel_size // 2
-        
-        for _ in range(iters_per_scale):
-            log_corr = (log_img - bias_field) * mask_sub
-            
-            # Separable 3D convolution along Z, Y, X dimensions
-            num = F.conv3d(log_corr[None, None, ...], k1d.view(1, 1, -1, 1, 1), padding=(pad, 0, 0))
-            num = F.conv3d(num, k1d.view(1, 1, 1, -1, 1), padding=(0, pad, 0))
-            num = F.conv3d(num, k1d.view(1, 1, 1, 1, -1), padding=(0, 0, pad))[0, 0]
-            
-            den = F.conv3d(mask_sub[None, None, ...], k1d.view(1, 1, -1, 1, 1), padding=(pad, 0, 0))
-            den = F.conv3d(den, k1d.view(1, 1, 1, -1, 1), padding=(0, pad, 0))
-            den = F.conv3d(den, k1d.view(1, 1, 1, 1, -1), padding=(0, 0, pad))[0, 0]
-            
-            low_pass = num / torch.clamp(den, min=eps)
-            
-            # Center the low-pass bias update so mean foreground intensity scale is preserved
-            fg_mask = mask_sub > 0
-            if fg_mask.sum() > 0:
-                mean_lp = low_pass[fg_mask].mean()
+        for _ in range(int(num_iters)):
+            resid = log_img - bias
+            sharpened = _n3_histogram_sharpen(resid, mask_sub)
+            update = _separable_gaussian(resid - sharpened, mask_sub, sigma=sig)
+            if int(fg.sum().item()) > 0:
+                update = update - update[fg].mean()
+                mean_abs = float(update[fg].abs().mean().item())
             else:
-                mean_lp = 0.0
-                
-            delta = (low_pass - mean_lp) * mask_sub
-            bias_field += 0.5 * delta
-            
-    # Interpolate bias field back to full resolution
-    if shrink_factor > 1:
-        bias_full = F.interpolate(bias_field[None, None, ...], size=img_arr.shape, mode='trilinear', align_corners=False)[0, 0]
-    else:
-        bias_full = bias_field
-        
-    # Apply bias field correction: corrected_image = image * exp(-bias_field)
-    corrected_t = img_t * torch.exp(-bias_full) * mask_t
-    
-    # Move back to CPU numpy array
-    corrected_arr = corrected_t.cpu().numpy().astype(np.float32)
-    
-    # Reconstruct SimpleITK image with identical metadata (origin, spacing, direction)
-    corrected_sitk = sitk.GetImageFromArray(corrected_arr)
-    corrected_sitk.CopyInformation(img_sitk)
-    
-    # Cleanup GPU memory
-    del img_t, mask_t, img_sub, mask_sub, log_img, bias_field, bias_full, corrected_t
+                mean_abs = 0.0
+            bias = bias + update
+            if mean_abs < convergence_thresh:
+                break
+
+    bias_sitk = sitk.GetImageFromArray(bias.detach().cpu().numpy().astype(np.float32))
+    bias_sitk.CopyInformation(img_shrunk)
+    log_bias_full = sitk.Resample(
+        bias_sitk, img_sitk, sitk.Transform(), sitk.sitkBSpline, 0.0, sitk.sitkFloat32
+    )
+    corrected_sitk = img_sitk / sitk.Exp(log_bias_full)
+
+    del img_sub, mask_sub, log_img, bias, img_shrunk, mask_shrunk, bias_sitk, log_bias_full
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        
     return corrected_sitk
+
+
+def n4_bias_field_correction_n4ax(img_sitk, mask_sitk, num_fitting_levels=4, num_iters=50):
+    """Optional JAX n4ax path (closest GPU match to ITK N4)."""
+    vol = sitk.GetArrayFromImage(img_sitk).astype(np.float32)
+    mask = sitk.GetArrayFromImage(mask_sitk) > 0
+    iters = tuple([int(num_iters)] * int(num_fitting_levels))
+    kwargs = dict(iters=iters, over_relax=1.0, conv_threshold=1.5e-3)
+    try:
+        corrected, _log_bias = n4ax.n4(vol, mask=mask, **kwargs)
+    except TypeError:
+        corrected, _log_bias = n4ax.n4(vol, **kwargs)
+    out = sitk.GetImageFromArray(np.asarray(corrected, dtype=np.float32))
+    out.CopyInformation(img_sitk)
+    return out
 
 
 # ==========================================
@@ -221,95 +369,88 @@ def n4_bias_field_correction_gpu(img_sitk, mask_sitk, shrink_factor=2, device_st
 def run_bc_on_patient(patient_entry, params, copy_unprocessed=True):
     """
     Performs N4 Bias Field Correction on all structural scans of a patient.
-    Uses PyTorch GPU algorithm if backend='gpu', otherwise falls back to SimpleITK CPU.
+    Mask pairing follows Jared V2 when *_SS / *_SS_bet files exist.
     """
     pid = patient_entry['id']
     structural_scans = patient_entry['structural_scans']
     mask_path = patient_entry.get('mask_path')
+    mask_by_scan = patient_entry.get('mask_by_scan') or {}
     out_dir = patient_entry['out_dir']
     other_files = patient_entry.get('other_files', [])
     
     backend = params.get('backend', 'gpu')
     shrink_factor = params.get('shrink_factor', 2)
     device_str = params.get('device', 'cuda')
+    num_fitting_levels = params.get('num_fitting_levels', 4)
+    num_iters = params.get('num_iters', 50)
+    convergence_thresh = params.get('convergence_thresh', 1e-6)
     
     os.makedirs(out_dir, exist_ok=True)
     
     print(f"   Patient ID: {pid}")
     print(f"   Structural Scans to Correct ({len(structural_scans)}): {[os.path.basename(s) for s in structural_scans]}")
-    if mask_path and os.path.exists(mask_path):
-        print(f"   Brain Mask Source: Pre-existing file ({os.path.basename(mask_path)})")
-    else:
-        print("   Brain Mask Source: Automatic Otsu Thresholding (Foreground mask computed on the fly)")
         
     # Process each structural scan
     for img_path in structural_scans:
         scan_name = os.path.basename(img_path)
-        
-        # Derive output filename (e.g. t1c.nii.gz -> t1c_BC.nii.gz)
-        if scan_name.endswith(".nii.gz"):
-            out_name = scan_name.replace(".nii.gz", OUTPUT_SUFFIX)
-        elif scan_name.endswith(".nii"):
-            out_name = scan_name.replace(".nii", OUTPUT_SUFFIX)
-        else:
-            out_name = scan_name + OUTPUT_SUFFIX
-            
+        out_name = _bc_output_name(scan_name)
         out_bc_path = os.path.join(out_dir, out_name)
         
         print(f"   -> Processing ({backend.upper()}): {scan_name} ...")
         scan_t0 = time.time()
         img = sitk.ReadImage(img_path, sitk.sitkFloat32)
         
-        # Determine brain / foreground mask
-        if mask_path and os.path.exists(mask_path):
-            mask = sitk.ReadImage(mask_path, sitk.sitkUInt8)
+        scan_mask_path = mask_by_scan.get(scan_name) or mask_path
+        if scan_mask_path and os.path.exists(scan_mask_path):
+            print(f"      Brain Mask: {os.path.basename(scan_mask_path)}")
+            mask = sitk.ReadImage(scan_mask_path, sitk.sitkUInt8)
         else:
-            # Automatic Fallback: Otsu Thresholding
+            print("      Brain Mask: Automatic Otsu Thresholding (no paired *_bet / brain_mask)")
             mask = sitk.OtsuThreshold(img, 0, 1)
             
-        # Execute Bias Field Correction
-        if backend == 'gpu' and torch.cuda.is_available():
+        if backend == "n4ax" and HAS_N4AX:
+            corrected_img = n4_bias_field_correction_n4ax(
+                img, mask,
+                num_fitting_levels=num_fitting_levels,
+                num_iters=num_iters,
+            )
+        elif backend == "gpu" and torch.cuda.is_available():
             corrected_img = n4_bias_field_correction_gpu(
                 img_sitk=img,
                 mask_sitk=mask,
                 shrink_factor=shrink_factor,
-                device_str=device_str
+                num_fitting_levels=num_fitting_levels,
+                num_iters=num_iters,
+                convergence_thresh=convergence_thresh,
+                device_str=device_str,
             )
         else:
-            # SimpleITK CPU Fallback
-            if shrink_factor > 1:
-                img_shrunk = sitk.Shrink(img, [shrink_factor] * img.GetDimension())
-                mask_shrunk = sitk.Shrink(mask, [shrink_factor] * mask.GetDimension())
-            else:
-                img_shrunk, mask_shrunk = img, mask
-                
-            corrector = sitk.N4BiasFieldCorrectionImageFilter()
-            corrector.SetMaximumNumberOfIterations([params['num_iters']] * params['num_fitting_levels'])
-            corrector.SetConvergenceThreshold(params['convergence_thresh'])
-            corrector.Execute(img_shrunk, mask_shrunk)
-            
-            log_bias_field = corrector.GetLogBiasFieldAsImage(img)
-            corrected_img = img / sitk.Exp(log_bias_field)
-            del img_shrunk, mask_shrunk, corrector, log_bias_field
+            if backend == "gpu" and not torch.cuda.is_available():
+                print("      [Warning] CUDA unavailable; using SimpleITK N4 (Jared V2).")
+            corrected_img = n4_bias_field_correction_sitk(
+                img, mask,
+                shrink_factor=shrink_factor,
+                num_fitting_levels=num_fitting_levels,
+                num_iters=num_iters,
+                convergence_thresh=convergence_thresh,
+            )
             
         sitk.WriteImage(corrected_img, out_bc_path)
         scan_elapsed = time.time() - scan_t0
         print(f"      [Saved] Bias-Corrected Scan: {out_name} (in {scan_elapsed:.2f}s)")
         
-        # Free memory
         del img, mask, corrected_img
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Synchronize non-structural files (segmentation masks, etc.) as-is
     if copy_unprocessed and other_files:
         for other_p in other_files:
             bname = os.path.basename(other_p)
             dest_p = os.path.join(out_dir, bname)
             if not os.path.exists(dest_p):
                 shutil.copy2(other_p, dest_p)
-                print(f"   [Synchronized] Copied segmentation/label file as-is: {bname}")
+                print(f"   [Synchronized] Copied segmentation/label/mask file as-is: {bname}")
 
 
 # ==========================================
@@ -344,6 +485,7 @@ def logging_loop(operation_name, input_root, output_root, patient_entries, param
         print(f"CUDA Available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
             print(f"GPU Device:    {torch.cuda.get_device_name(0)}")
+        print(f"n4ax Available: {HAS_N4AX}")
         print(f"Pandas:        {pd.__version__}")
         print(f"FPDF Available: {HAS_FPDF}")
         
@@ -379,8 +521,7 @@ def logging_loop(operation_name, input_root, output_root, patient_entries, param
             all_done = True
             for img_path in structural_scans:
                 scan_name = os.path.basename(img_path)
-                out_name = scan_name.replace(".nii.gz", OUTPUT_SUFFIX) if scan_name.endswith(".nii.gz") else scan_name + OUTPUT_SUFFIX
-                out_bc_path = os.path.join(out_dir, out_name)
+                out_bc_path = os.path.join(out_dir, _bc_output_name(scan_name))
                 if not (os.path.exists(out_bc_path) and os.path.getsize(out_bc_path) > 0):
                     all_done = False
                     break
@@ -472,37 +613,36 @@ def discover_patient_files(input_root, output_root, patient_subset=None):
         p_out_dir = os.path.join(output_root, pid)
         all_p_files = os.listdir(p_dir)
         
-        # 1. Look for pre-existing brain mask
-        mask_file = next((
-            f for f in all_p_files 
-            if ("bet" in f.lower() or "brain_mask" in f.lower()) and (f.endswith(".nii.gz") or f.endswith(".nii"))
-        ), None)
-        
-        # 2. Look for segmentation masks (e.g. core_seg.nii.gz, whole_seg.nii.gz, -seg.nii.gz)
-        seg_files = [
-            f for f in all_p_files 
-            if ("seg" in f.lower() or "label" in f.lower() or "tumor" in f.lower()) 
-            and (f.endswith(".nii.gz") or f.endswith(".nii"))
-            and f != mask_file
-        ]
-        
-        # 3. Identify structural MRI scans (all other NIfTI images)
+        mask_files = [f for f in all_p_files if _is_brain_mask_file(f)]
+        seg_files = [f for f in all_p_files if _is_seg_file(f)]
         structural_files = [
-            f for f in all_p_files 
-            if (f.endswith(".nii.gz") or f.endswith(".nii"))
-            and f != mask_file
+            f for f in all_p_files
+            if _is_nifti(f)
+            and f not in mask_files
             and f not in seg_files
             and not f.startswith('.')
+            and "_BC.nii" not in f
         ]
         
         if not structural_files:
             continue
+
+        mask_by_scan = {}
+        for sf in structural_files:
+            paired = _paired_mask_name(sf, all_p_files)
+            if paired:
+                mask_by_scan[sf] = os.path.join(p_dir, paired)
+        
+        fallback_mask = None
+        if mask_files:
+            fallback_mask = os.path.join(p_dir, sorted(mask_files)[0])
             
         patient_entries.append({
             'id': pid,
             'structural_scans': [os.path.join(p_dir, f) for f in structural_files],
-            'mask_path': os.path.join(p_dir, mask_file) if mask_file else None,
-            'other_files': [os.path.join(p_dir, sf) for sf in seg_files],
+            'mask_path': fallback_mask,
+            'mask_by_scan': mask_by_scan,
+            'other_files': [os.path.join(p_dir, sf) for sf in (seg_files + mask_files)],
             'out_dir': p_out_dir
         })
         
@@ -521,8 +661,11 @@ def main():
     parser.add_argument("-i", "--input_root", type=str, default=None, help="Custom input root path")
     parser.add_argument("-o", "--output_root", type=str, default=None, help="Custom output root path")
     parser.add_argument("-s", "--subset", type=str, default=None, help="Patient subset range (e.g. '0:5')")
-    parser.add_argument("--shrink_factor", type=int, default=2, help="Shrink factor for N4 bias correction")
-    parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "sitk"], help="Processing backend: 'gpu' (PyTorch CUDA) or 'sitk' (SimpleITK CPU)")
+    parser.add_argument("--shrink_factor", type=int, default=2, help="Shrink factor (Jared V2 default 2)")
+    parser.add_argument("--num_iters", type=int, default=50, help="Iterations per fitting level (Jared V2 default 50)")
+    parser.add_argument("--num_fitting_levels", type=int, default=4, help="N4 multi-resolution levels (Jared V2 default 4)")
+    parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "n4ax", "sitk"],
+                        help="sitk = Jared V2 SimpleITK N4 (use this for model benchmark). gpu = CUDA N4-style approx. n4ax = JAX N4 if installed.")
     parser.add_argument("--device", type=str, default="cuda", help="PyTorch GPU device (e.g. 'cuda', 'cuda:0')")
     
     args = parser.parse_args()
@@ -540,12 +683,23 @@ def main():
         
     params = DEFAULT_PARAMETERS.copy()
     params["shrink_factor"] = args.shrink_factor
+    params["num_iters"] = args.num_iters
+    params["num_fitting_levels"] = args.num_fitting_levels
     params["backend"] = args.backend
     params["device"] = args.device
-    
-    if args.backend == "gpu" and not torch.cuda.is_available():
-        print("[Warning] CUDA is not available on this system. Falling back to SimpleITK CPU backend.")
+
+    if args.backend == "n4ax" and not HAS_N4AX:
+        print("[Warning] n4ax is not installed. Falling back to PyTorch GPU backend.")
+        params["backend"] = "gpu"
+    if params["backend"] == "gpu" and not torch.cuda.is_available():
+        print("[Warning] CUDA is not available on this system. Falling back to SimpleITK N4 (Jared V2).")
         params["backend"] = "sitk"
+
+    if params["backend"] == "gpu":
+        print("[Benchmark] GPU backend approximates ITK N4 (Gaussian field, not B-spline).")
+        print("            For Jared-identical model-benchmark inputs, rerun with --backend sitk.")
+    elif params["backend"] == "sitk":
+        print("[Benchmark] SimpleITK N4 backend matches Jared V2 (GetLogBiasFieldAsImage + I/exp(log_B)).")
         
     print(f"\n==================================================")
     print(f"   IDiA Step 3 GPU N4 Bias Correction ({dataset_name})")

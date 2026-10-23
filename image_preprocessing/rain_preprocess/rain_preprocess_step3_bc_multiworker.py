@@ -63,8 +63,8 @@ DATASETS_CONFIG = {
     },
     "2": {
         "name": "BraTS2025-MET",
-        "input_root": r"/Users/rains/rainworkspace/2-IDIALab/Datasets/BraTS2026/MICCAI-LH-BraTS2025-MET-Challenge-Training",
-        "output_root": r"/Users/rains/rainworkspace/2-IDIALab/Datasets/BraTS2026/BraTS2025-MET-Training-BC_complete",
+        "input_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\BraTS2026\MICCAI-LH-BraTS2025-MET-Challenge-Training",
+        "output_root": r"D:\A1_RainSun_20240916\1-UWMadison\IDiA-Lab\Medical_Images_Public\BraTS2026\BraTS2025-MET-Training-BC_complete",
     }
 }
 
